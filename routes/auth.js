@@ -50,7 +50,7 @@ router.post('/registrer/elev', async (req, res) => {
   const { data: eks } = await supabase.from('brugere').select('id').eq('email', email).single();
   if (eks) return res.status(400).json({ fejl: 'Email er allerede i brug.' });
   const hash = await bcrypt.hash(password, 10);
-  const { data, error } = await supabase.from('brugere').insert({ navn, email, password_hash: hash, rolle: 'elev', klass, status: 'Offline' }).select('id, navn, email, rolle, klass').single();
+  const { data, error } = await supabase.from('brugere').insert({ navn, email, password_hash: hash, rolle: 'elev', klass, status: 'afventer' }).select('id, navn, email, rolle, klass').single();
   if (error) {
     console.error('Registrer elev fejl:', error);
     return res.status(500).json({ fejl: 'Kunne ikke oprette konto.', detaljer: error.message });
@@ -87,6 +87,33 @@ router.post('/registrer/foraelder', async (req, res) => {
   }
   const token = genToken(data);
   res.status(201).json({ token, bruger: data });
+});
+
+router.post('/godkend/elev', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ fejl: 'Ingen token.' });
+  try {
+    const payload = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
+    if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan godkende elever.' });
+    const { elevId } = req.body;
+    if (!elevId) return res.status(400).json({ fejl: 'elevId kræves.' });
+    const { data, error } = await supabase.from('brugere').update({ status: 'Offline' }).eq('id', elevId).eq('rolle', 'elev').eq('status', 'afventer').select('id, navn, email, rolle, klass').single();
+    if (error || !data) return res.status(404).json({ fejl: 'Elev ikke fundet eller allerede godkendt.' });
+    res.json({ besked: 'Elev godkendt!', bruger: data });
+  } catch { res.status(401).json({ fejl: 'Ugyldig token.' }); }
+});
+
+router.get('/afventende/elever', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ fejl: 'Ingen token.' });
+  try {
+    const payload = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
+    if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan se afventende elever.' });
+    const { data: laerer } = await supabase.from('brugere').select('klass').eq('id', payload.id).single();
+    const { data, error } = await supabase.from('brugere').select('id, navn, email, klass').eq('rolle', 'elev').eq('status', 'afventer').eq('klass', laerer.klass);
+    if (error) return res.status(500).json({ fejl: 'Kunne ikke hente elever.' });
+    res.json({ elever: data || [] });
+  } catch { res.status(401).json({ fejl: 'Ugyldig token.' }); }
 });
 
 router.get('/mig', async (req, res) => {
