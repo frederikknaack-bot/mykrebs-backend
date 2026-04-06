@@ -11,6 +11,13 @@ const genToken = (bruger) => jwt.sign(
   { expiresIn: '30d' }
 );
 
+const tjekToken = (req) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return null;
+  try { return jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET); }
+  catch { return null; }
+};
+
 router.post('/login/elev', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ fejl: 'Email og adgangskode kræves.' });
@@ -90,41 +97,122 @@ router.post('/registrer/foraelder', async (req, res) => {
 });
 
 router.post('/godkend/elev', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ fejl: 'Ingen token.' });
-  try {
-    const payload = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
-    if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan godkende elever.' });
-    const { elevId } = req.body;
-    if (!elevId) return res.status(400).json({ fejl: 'elevId kræves.' });
-    const { data, error } = await supabase.from('brugere').update({ status: 'Offline' }).eq('id', elevId).eq('rolle', 'elev').eq('status', 'afventer').select('id, navn, email, rolle, klass').single();
-    if (error || !data) return res.status(404).json({ fejl: 'Elev ikke fundet eller allerede godkendt.' });
-    res.json({ besked: 'Elev godkendt!', bruger: data });
-  } catch { res.status(401).json({ fejl: 'Ugyldig token.' }); }
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan godkende elever.' });
+  const { elevId } = req.body;
+  if (!elevId) return res.status(400).json({ fejl: 'elevId kræves.' });
+  const { data, error } = await supabase.from('brugere').update({ status: 'Offline' }).eq('id', elevId).eq('rolle', 'elev').eq('status', 'afventer').select('id, navn, email, rolle, klass').single();
+  if (error || !data) return res.status(404).json({ fejl: 'Elev ikke fundet eller allerede godkendt.' });
+  res.json({ besked: 'Elev godkendt!', bruger: data });
 });
 
 router.get('/afventende/elever', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ fejl: 'Ingen token.' });
-  try {
-    const payload = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
-    if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan se afventende elever.' });
-    const { data: laerer } = await supabase.from('brugere').select('klass').eq('id', payload.id).single();
-    const { data, error } = await supabase.from('brugere').select('id, navn, email, klass').eq('rolle', 'elev').eq('status', 'afventer').eq('klass', laerer.klass);
-    if (error) return res.status(500).json({ fejl: 'Kunne ikke hente elever.' });
-    res.json({ elever: data || [] });
-  } catch { res.status(401).json({ fejl: 'Ugyldig token.' }); }
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan se afventende elever.' });
+  const { data: laerer } = await supabase.from('brugere').select('klass').eq('id', payload.id).single();
+  const { data, error } = await supabase.from('brugere').select('id, navn, email, klass').eq('rolle', 'elev').eq('status', 'afventer').eq('klass', laerer.klass);
+  if (error) return res.status(500).json({ fejl: 'Kunne ikke hente elever.' });
+  res.json({ elever: data || [] });
+});
+
+// ══════════════════════════════════════
+// FORÆLDRE-BARN TILKNYTNING
+// ══════════════════════════════════════
+
+// Forælder søger efter sit barn
+router.get('/soeg/barn', async (req, res) => {
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'foraelder') return res.status(403).json({ fejl: 'Kun forældre kan søge efter børn.' });
+  const { navn, klass } = req.query;
+  if (!navn) return res.status(400).json({ fejl: 'Navn kræves.' });
+  let query = supabase.from('brugere').select('id, navn, klass, avatar_url').eq('rolle', 'elev').neq('status', 'afventer').ilike('navn', `%${navn}%`);
+  if (klass) query = query.eq('klass', klass);
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ fejl: 'Søgning fejlede.' });
+  res.json({ resultater: data || [] });
+});
+
+// Forælder sender tilknytningsanmodning
+router.post('/tilknyt/barn', async (req, res) => {
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'foraelder') return res.status(403).json({ fejl: 'Kun forældre kan tilknytte børn.' });
+  const { barnId } = req.body;
+  if (!barnId) return res.status(400).json({ fejl: 'barnId kræves.' });
+  // Tjek at barnet eksisterer og er en elev
+  const { data: barn } = await supabase.from('brugere').select('id, navn, klass').eq('id', barnId).eq('rolle', 'elev').single();
+  if (!barn) return res.status(404).json({ fejl: 'Elev ikke fundet.' });
+  // Tjek om tilknytning allerede eksisterer
+  const { data: eks } = await supabase.from('foraeldre_boern').select('id, status').eq('foraelder_id', payload.id).eq('barn_id', barnId).single();
+  if (eks) {
+    if (eks.status === 'godkendt') return res.status(400).json({ fejl: 'Du er allerede tilknyttet dette barn.' });
+    if (eks.status === 'afventer') return res.status(400).json({ fejl: 'Anmodning er allerede sendt og afventer godkendelse.' });
+  }
+  const { data, error } = await supabase.from('foraeldre_boern').insert({ foraelder_id: payload.id, barn_id: barnId, status: 'afventer' }).select('id, status').single();
+  if (error) return res.status(500).json({ fejl: 'Kunne ikke sende anmodning.', detaljer: error.message });
+  res.status(201).json({ besked: 'Anmodning sendt! Barnets klasselærer skal godkende den.', tilknytning: data });
+});
+
+// Hent forældres tilknyttede børn
+router.get('/mine/boern', async (req, res) => {
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'foraelder') return res.status(403).json({ fejl: 'Kun forældre kan hente børn.' });
+  const { data, error } = await supabase.from('foraeldre_boern').select('id, status, barn:brugere!foraeldre_boern_barn_id_fkey(id, navn, klass, avatar_url)').eq('foraelder_id', payload.id).eq('status', 'godkendt');
+  if (error) return res.status(500).json({ fejl: 'Kunne ikke hente børn.' });
+  const boern = (data || []).map(t => ({ ...t.barn, tilknytning_id: t.id }));
+  res.json({ boern });
+});
+
+// Lærer ser afventende tilknytningsanmodninger for sin klasse
+router.get('/afventende/tilknytninger', async (req, res) => {
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan se tilknytningsanmodninger.' });
+  const { data: laerer } = await supabase.from('brugere').select('klass').eq('id', payload.id).single();
+  if (!laerer?.klass) return res.json({ anmodninger: [] });
+  const { data, error } = await supabase.from('foraeldre_boern')
+    .select('id, status, foraelder:brugere!foraeldre_boern_foraelder_id_fkey(id, navn, email), barn:brugere!foraeldre_boern_barn_id_fkey(id, navn, klass)')
+    .eq('status', 'afventer')
+    .eq('barn.klass', laerer.klass);
+  if (error) return res.status(500).json({ fejl: 'Kunne ikke hente anmodninger.' });
+  const filtrerede = (data || []).filter(a => a.barn?.klass === laerer.klass);
+  res.json({ anmodninger: filtrerede });
+});
+
+// Lærer godkender tilknytning
+router.post('/godkend/tilknytning', async (req, res) => {
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan godkende tilknytninger.' });
+  const { tilknytningId } = req.body;
+  if (!tilknytningId) return res.status(400).json({ fejl: 'tilknytningId kræves.' });
+  const { data, error } = await supabase.from('foraeldre_boern').update({ status: 'godkendt' }).eq('id', tilknytningId).eq('status', 'afventer').select('id, status').single();
+  if (error || !data) return res.status(404).json({ fejl: 'Anmodning ikke fundet.' });
+  res.json({ besked: 'Tilknytning godkendt!' });
+});
+
+// Lærer afviser tilknytning
+router.post('/afvis/tilknytning', async (req, res) => {
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  if (payload.rolle !== 'laerer') return res.status(403).json({ fejl: 'Kun lærere kan afvise tilknytninger.' });
+  const { tilknytningId } = req.body;
+  if (!tilknytningId) return res.status(400).json({ fejl: 'tilknytningId kræves.' });
+  const { error } = await supabase.from('foraeldre_boern').delete().eq('id', tilknytningId);
+  if (error) return res.status(500).json({ fejl: 'Kunne ikke afvise anmodning.' });
+  res.json({ besked: 'Anmodning afvist.' });
 });
 
 router.get('/mig', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ fejl: 'Ingen token.' });
-  try {
-    const payload = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
-    const { data } = await supabase.from('brugere').select('id, navn, email, rolle, klass, avatar_url, status').eq('id', payload.id).single();
-    if (!data) return res.status(404).json({ fejl: 'Bruger ikke fundet.' });
-    res.json({ bruger: data });
-  } catch { res.status(401).json({ fejl: 'Ugyldig token.' }); }
+  const payload = tjekToken(req);
+  if (!payload) return res.status(401).json({ fejl: 'Ingen token.' });
+  const { data } = await supabase.from('brugere').select('id, navn, email, rolle, klass, avatar_url, status').eq('id', payload.id).single();
+  if (!data) return res.status(404).json({ fejl: 'Bruger ikke fundet.' });
+  res.json({ bruger: data });
 });
 
 module.exports = router;
